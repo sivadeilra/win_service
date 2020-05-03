@@ -30,10 +30,9 @@ impl win_service::ServiceHandler for HelloService {
 
     fn stop(&mut self, updater: &mut StatusUpdater) {
         info!("hello_server is stopping");
-        self.listener = None;        
+        self.listener = None;
     }
 }
-
 
 // win_service::single_service!("hello_service", HelloService);
 

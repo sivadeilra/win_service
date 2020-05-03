@@ -1,3 +1,8 @@
+//! Allows Rust programs to run as Windows Services.
+//!
+//! # References
+//! * [Service State Transitions](https://docs.microsoft.com/en-us/windows/win32/services/service-status-transitions?redirectedfrom=MSDN)
+
 #![allow(unused)]
 
 use core::ptr::null_mut;
@@ -24,7 +29,6 @@ pub struct Error {}
 
 pub trait ServiceHandler {
     fn service_name(&self) -> &str;
-    // fn create(updater: &mut StatusUpdater) -> Self;
     fn start(&mut self, updater: &mut StatusUpdater) -> Result<(), ServiceError> {
         Ok(())
     }
@@ -62,6 +66,10 @@ impl StatusUpdater {
     }
 
     fn send_update(&mut self, wait_hint: Duration) {
+        if self.service_status_handle.is_null() {
+            return;
+        }
+
         let mut status = winsvc::SERVICE_STATUS {
             dwCheckPoint: self.checkpoint,
             dwControlsAccepted: self.controls_accepted,
@@ -285,7 +293,7 @@ unsafe extern "system" fn service_proc<S: ServiceHandler + Default>(
 
             info!("sending status update for START_PENDING");
             let status_updater = &mut state.status_updater;
-            status_updater.checkpoint();
+            // status_updater.checkpoint();
 
             // <-- state is SERVICE_START_PENDING
             // Call into the service code to start it.
@@ -305,7 +313,6 @@ unsafe extern "system" fn service_proc<S: ServiceHandler + Default>(
         }
 
         info!("service has successfully started.");
-        
 
         // Now we just wait to receive the "stop" request.
         let mut state_guard = service_control_handler_context.state.lock().unwrap();
@@ -322,18 +329,128 @@ unsafe extern "system" fn service_proc<S: ServiceHandler + Default>(
     }
 }
 
-pub fn single_service_main<S: ServiceHandler + Default>(service_name: &str) {
+mod standalone {
+    use super::*;
+
+    use atomic_lazy::AtomicLazy;
+    use winapi::shared::minwindef::BOOL;
+    use winapi::um::consoleapi;
+    use winapi::um::synchapi;
+    use winapi::um::winbase::INFINITE;
+    use winapi::um::wincon;
+    use winapi::um::winnt::HANDLE;
+
+    static mut STANDALONE_STOP_EVENT: HANDLE = null_mut();
+
+    pub(crate) fn run_service_standalone<S: ServiceHandler + Default + Send + 'static>(
+        service_name: &str,
+    ) {
+        let mut service = S::default();
+
+        let mut status_updater = StatusUpdater {
+            checkpoint: 0,
+            controls_accepted: 0,
+            current_state: 0,
+            service_status_handle: null_mut(),
+            service_type: 0,
+        };
+
+        eprintln!("Running service in standalone mode.");
+        match service.start(&mut status_updater) {
+            Err(e) => {
+                eprintln!("Failed to start service: {:?}", e);
+                std::process::exit(1);
+            }
+            Ok(()) => {}
+        }
+
+        unsafe {
+            let stop_event: HANDLE = synchapi::CreateEventW(null_mut(), 1, 0, null_mut());
+            assert_ne!(stop_event, null_mut(), "Failed to create stop event");
+            STANDALONE_STOP_EVENT = stop_event;
+            consoleapi::SetConsoleCtrlHandler(Some(console_control_handler), 1);
+
+            eprintln!("Service has started. Press Control-C to terminate service.");
+
+            synchapi::WaitForSingleObject(stop_event, INFINITE);
+
+            eprintln!("Received Control-C. Stopping service.");
+        }
+
+        service.stop(&mut status_updater);
+        eprintln!("Service has stopped.");
+    }
+
+    extern "system" fn console_control_handler(control_type: u32) -> BOOL {
+        match control_type {
+            wincon::CTRL_C_EVENT
+            | wincon::CTRL_BREAK_EVENT
+            | wincon::CTRL_CLOSE_EVENT
+            | wincon::CTRL_LOGOFF_EVENT
+            | wincon::CTRL_SHUTDOWN_EVENT => {
+                eprintln!("Stopping standalone service...");
+                unsafe {
+                    synchapi::SetEvent(STANDALONE_STOP_EVENT);
+                }
+                1
+            }
+            _ => {
+                eprintln!("Unrecognized console control code: {}", control_type);
+                0
+            }
+        }
+    }
+}
+
+pub fn single_service_main<S: ServiceHandler + Send + Default + 'static>(service_name: &str) {
+    let program_name: &str = "<program.exe>";
+
+    let mut args: Vec<String> = std::env::args().collect();
+
+    let mut opts = getopts::Options::new();
+    opts.optopt(
+        "s",
+        "standalone",
+        "Run a specific service as a standalone process, not under the Service Control Manager.",
+        "SERVICE",
+    );
+    opts.optflag("h", "help", "Show detailed help");
+
+    let matches = match opts.parse(&args[1..]) {
+        Ok(m) => {
+            if m.opt_present("help") {
+                print!("{}", opts.usage(program_name));
+                std::process::exit(1);
+            }
+            if let Some(s) = m.opt_str("standalone") {
+                eprintln!("Running standalone: '{}'", s);
+                standalone::run_service_standalone::<S>(service_name);
+                std::process::exit(1);
+            }
+            if !m.free.is_empty() {
+                eprintln!("Unexpected args: {:?}", m.free);
+                opts.short_usage(program_name);
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("{:?}", e);
+            print!("{}", opts.short_usage(program_name));
+            std::process::exit(1);
+        }
+    };
+
     unsafe {
         let service_name_wstr = U16CString::from_str(service_name).unwrap();
         let service_table = [
             winsvc::SERVICE_TABLE_ENTRYW {
-            lpServiceName: service_name_wstr.as_ptr(),
-            lpServiceProc: Some(service_proc::<S>),
-        },
-        winsvc::SERVICE_TABLE_ENTRYW {
-            lpServiceName: null_mut(),
-            lpServiceProc: None,
-        },
+                lpServiceName: service_name_wstr.as_ptr(),
+                lpServiceProc: Some(service_proc::<S>),
+            },
+            winsvc::SERVICE_TABLE_ENTRYW {
+                lpServiceName: null_mut(),
+                lpServiceProc: None,
+            },
         ];
         info!("Calling StartServiceCtrlDispatcherW");
         if winsvc::StartServiceCtrlDispatcherW(&service_table[0]) != 0 {
